@@ -2,39 +2,61 @@
 pragma solidity ^0.8.28;
 import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
+
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
 import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol';
 import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol';
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import "@uniswap/v2-periphery/contracts/libraries/UniswapV2OracleLibrary.sol";
+import '@uniswap/lib/contracts/libraries/FixedPoint.sol';
+
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 contract Wrapper {
-    //address private constant UNISWAP_V2_ROUTER = 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D;
-    address immutable myToken;
-    address immutable stableCoin;
+    uint256 public constant PERIOD = 10 minutes;
 
-    IUniswapV2Pair immutable pair;
+    IUniswapV2Router02 public router;
+
+    IUniswapV2Pair public immutable pair;
+    address public immutable token0;
+    address public immutable token1;
+        
+    address public immutable stableCoin;
+    address public immutable myToken;
+
+    uint256 public price0CumulativeLast;
+    uint256 public price1CumulativeLast;
+    uint256 public blockTimestampLast;
+    
+    FixedPoint.uq112x112 public price0Average;
+    FixedPoint.uq112x112 public price1Average;
 
     IPyth pyth;
-    
     bytes32 btcUsdPriceId;
  
-    constructor(address _uniswapV2Router, address _factory, address _myToken, addresss _stableCoin, address _chainlinkOracle, address _pythOracle, bytes32 _btcUsdPriceId) {
-        IUniswapV2Router02 router = IUniswapV2Router02(_uniswapV2Router);
+    constructor(address _uniswapV2Router, address _factory, address _myToken, address _stableCoin, address _chainlinkOracle, address _pythOracle, bytes32 _btcUsdPriceId) {
+        router = IUniswapV2Router02(_uniswapV2Router);
+        
         pair = IUniswapV2Pair(UniswapV2Library.pairFor(_factory, _myToken, _stableCoin));
         
-        myToken = _myToken;
         stableCoin = _stableCoin;
+        myToken = _myToken;
+
+        token0 = pair.token0();
+        token1 = pair.token1();
         
-        price0CumulativeLast = _pair.price0CumulativeLast(); // fetch the current accumulated price value (1 / 0)
-        price1CumulativeLast = _pair.price1CumulativeLast(); // fetch the current accumulated price value (0 / 1)
+        price0CumulativeLast = pair.price0CumulativeLast(); // fetch the current accumulated price value (1 / 0)
+        price1CumulativeLast = pair.price1CumulativeLast(); // fetch the current accumulated price value (0 / 1)
+
         uint112 reserve0;
         uint112 reserve1;
-        (reserve0, reserve1) = _pair.getReserves();
+        (reserve0, reserve1) = pair.getReserves();
         require(reserve0 != 0 && reserve1 != 0, 'ExampleOracleSimple: NO_RESERVES'); 
 
         pythOracle = IPyth(_pythOracle);
         chainlinkOracle = AggregatorV3Interface(_chainlinkOracle);
+        
         btcUsdPriceId = _btcUsdPriceId;
     }        
 
@@ -42,7 +64,7 @@ contract Wrapper {
         PythStructs.Price memory price = pyth.getPriceNoOlderThan(
             _btcUsdPriceId,
             60
-        )
+        );
         return uint256(price.price);
     } 
 
@@ -51,27 +73,79 @@ contract Wrapper {
         return uint256(price);
     }
 
-    function getTwapPrice() public view {
-        
+    function twapUpdate() internal {
+        (uint256 price0Cumulative, uint256 price1Cumulative, uint256 blockTimeStamp) =
+            UniswapV2OracleLibrary.currentCumulativePrices(address(pair));
+        timeElapsed = blockTimeStamp - blockTimestampLast;
+
+        require(timeElapsed >= PERIOD, "Period not elapsed");
+    
+        price0Average = FixedPoint.uq112x112(uint224((price0Cumulative - price0CumulativeLast) / timeElapsed));
+        price1Average = FixedPoint.uq112x112(uint224((price1Cumulative - price1CumulativeLast) / timeElapsed));
+
+        price0CumulativeLast = price0Cumulative;
+        price1CumulativeLast = price1Cumulative;
+        blockTimestampLast = blockTimeStamp;
     }
 
-    function addLiquidity(uint256 _myTokenAmount, uint256 _stableCoinAmount, uint256 _myTokenAmountDesired, uint256 _stableCoinAmountDesired) public {
-        IERC20(stableCoin).transferFrom(msg.sender, address(this), _stableCoinAmount);
-        uint256 myTokenAmount;
-        if (_myTokenAmount > 0) {
-            IERC20(myToken).transferFrom(msg.sender, address(this), _myTokenAmount);
-            myTokenAmount = _myTokenAmount;
+    function getTwapPrice(address token, uint256 amountIn) public view returns (uint256 amountOut) {
+        twapUpdate();
+        if (token == token0) {
+            amountOut = price0Average.mul(amountIn).decode144();
         }
-        // дописать
-       /* else {
-            uint256 tokenPrice = getChainlinkPrice();
-            myTokenAmount = (_stableCoinAmount * 1e18) / tokenPrice;
-        } */ 
+        else {
+            require(token == token1, "Invalid token");
+            amountOut = price1Average.mul(amountIn).decode144();
+        }
+    }
 
-        IERC20(stableCoin).approve(router, _stableCoinAmount);
+    function addLiquidity(uint256 _myTokenAmount, uint256 _stableCoinAmount) public {
+        require(_stableCoinAmount > 0, "U have to add non-zero stablecoin amount");
+        IERC20(stableCoin).transferFrom(msg.sender, address(this), _stableCoinAmount);
+
+        uint256 myTokenAmount;
+        uint256 stableCoinAmount;
+        if (_myTokenAmount > 0) {
+            myTokenAmount = _myTokenAmount;
+            stableCoinAmount = _stableCoinAmount;
+        }
+        else {
+            stableCoinAmount = ((_stableCoinAmount / 2)  * 1e18);
+            myTokenAmount = stableCoinAmount / getChainlinkPrice();
+            require(myTokenAmount > 0, "Calculated token amount must be greater than zero");
+            router.swapExactTokensForTokens(
+                stableCoinAmount, 
+                myTokenAmount, 
+                [token0, token1], 
+                msg.sender, 
+                block.timestamp + 300
+                );
+        }
+        IERC20(myToken).transferFrom(msg.sender, address(this), myTokenAmount); 
+
+        IERC20(stableCoin).approve(router, stableCoinAmount);
         IERC20(myToken).approve(router, myTokenAmount);
         
-        router.addLiquidity(stableCoin, myToken, _stableCoinAmount, _myTokenAmount, 0, 0, msg.sender, block.timestamp() + 300);
+        router.addLiquidity(
+            stableCoin, 
+            myToken, 
+            stableCoinAmount, 
+            myTokenAmount, 
+            0, 
+            0, 
+            msg.sender, 
+            block.timestamp + 300
+        );
+        
+        emit AddLiquidity(
+            stableCoin, 
+            myToken, 
+            stableCoinAmount, 
+            myTokenAmount, 
+            0, 
+            0, 
+            msg.sender, 
+            block.timestamp + 300
+            );
     }
-
 }
