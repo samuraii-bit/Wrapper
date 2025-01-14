@@ -3,11 +3,12 @@ pragma solidity ^0.8.28;
 import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 
 import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol';
 import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol';
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
+import "@uniswap/v2-periphery/contracts/libraries/UniswapV2Library.sol";
 import "@uniswap/v2-periphery/contracts/libraries/UniswapV2OracleLibrary.sol";
 import '@uniswap/lib/contracts/libraries/FixedPoint.sol';
 
@@ -32,8 +33,21 @@ contract Wrapper {
     FixedPoint.uq112x112 public price0Average;
     FixedPoint.uq112x112 public price1Average;
 
-    IPyth pyth;
+    AggregatorV3Interface chainlinkOracle;
+
+    IPyth pythOracle;
     bytes32 btcUsdPriceId;
+
+    event AddLiquidity(
+        address _token0, 
+        address _token1, 
+        uint256 _token0AmountDesired, 
+        uint256 _token1AmountDesired, 
+        uint256 _token0Min,
+        uint256 _token1Min,
+        address _to, 
+        uint256 _deadline
+    );
  
     constructor(address _uniswapV2Router, address _factory, address _myToken, address _stableCoin, address _chainlinkOracle, address _pythOracle, bytes32 _btcUsdPriceId) {
         router = IUniswapV2Router02(_uniswapV2Router);
@@ -58,11 +72,11 @@ contract Wrapper {
         chainlinkOracle = AggregatorV3Interface(_chainlinkOracle);
         
         btcUsdPriceId = _btcUsdPriceId;
-    }        
+    }      
 
     function getPythPrice() public view returns(uint256) {
-        PythStructs.Price memory price = pyth.getPriceNoOlderThan(
-            _btcUsdPriceId,
+        PythStructs.Price memory price = pythOracle.getPriceNoOlderThan(
+            btcUsdPriceId,
             60
         );
         return uint256(price.price);
@@ -76,7 +90,7 @@ contract Wrapper {
     function twapUpdate() internal {
         (uint256 price0Cumulative, uint256 price1Cumulative, uint256 blockTimeStamp) =
             UniswapV2OracleLibrary.currentCumulativePrices(address(pair));
-        timeElapsed = blockTimeStamp - blockTimestampLast;
+        uint256 timeElapsed = blockTimeStamp - blockTimestampLast;
 
         require(timeElapsed >= PERIOD, "Period not elapsed");
     
