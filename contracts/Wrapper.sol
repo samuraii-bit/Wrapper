@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.28;
+
+import "./interfaces/IWrapper.sol";
+
 import "@pythnetwork/pyth-sdk-solidity/IPyth.sol";
 import "@pythnetwork/pyth-sdk-solidity/PythStructs.sol";
 
@@ -8,13 +11,14 @@ import "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.so
 import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Factory.sol';
 import '@uniswap/v2-core/contracts/interfaces/IUniswapV2Pair.sol';
 import "@uniswap/v2-periphery/contracts/interfaces/IUniswapV2Router02.sol";
-import "@uniswap/v2-periphery/contracts/libraries/UniswapV2Library.sol";
-import "@uniswap/v2-periphery/contracts/libraries/UniswapV2OracleLibrary.sol";
-import '@uniswap/lib/contracts/libraries/FixedPoint.sol';
+import "./neededContracts/UniswapV2Library.sol";
+import "./neededContracts/UniswapV2OracleLibrary.sol";
+import './neededContracts/FixedPoint.sol';
 
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
-contract Wrapper {
+contract Wrapper is IWrapper {
+    using FixedPoint for *;
     uint256 public constant PERIOD = 10 minutes;
 
     IUniswapV2Router02 public router;
@@ -52,7 +56,7 @@ contract Wrapper {
     constructor(address _uniswapV2Router, address _factory, address _myToken, address _stableCoin, address _chainlinkOracle, address _pythOracle, bytes32 _btcUsdPriceId) {
         router = IUniswapV2Router02(_uniswapV2Router);
         
-        pair = IUniswapV2Pair(UniswapV2Library.pairFor(_factory, _myToken, _stableCoin));
+        pair = IUniswapV2Pair(UniswapV2Library.pairFor(_factory, _stableCoin, _myToken));
         
         stableCoin = _stableCoin;
         myToken = _myToken;
@@ -65,7 +69,7 @@ contract Wrapper {
 
         uint112 reserve0;
         uint112 reserve1;
-        (reserve0, reserve1) = pair.getReserves();
+        (reserve0, reserve1, ) = pair.getReserves();
         require(reserve0 != 0 && reserve1 != 0, 'ExampleOracleSimple: NO_RESERVES'); 
 
         pythOracle = IPyth(_pythOracle);
@@ -74,12 +78,12 @@ contract Wrapper {
         btcUsdPriceId = _btcUsdPriceId;
     }      
 
-    function getPythPrice() public view returns(uint256) {
+    function getPythPrice() public view returns(int64) {
         PythStructs.Price memory price = pythOracle.getPriceNoOlderThan(
             btcUsdPriceId,
             60
         );
-        return uint256(price.price);
+        return price.price;
     } 
 
     function getChainlinkPrice() public view returns(uint256) {
@@ -102,7 +106,7 @@ contract Wrapper {
         blockTimestampLast = blockTimeStamp;
     }
 
-    function getTwapPrice(address token, uint256 amountIn) public view returns (uint256 amountOut) {
+    function getTwapPrice(address token, uint256 amountIn) public returns (uint256 amountOut) {
         twapUpdate();
         if (token == token0) {
             amountOut = price0Average.mul(amountIn).decode144();
@@ -127,18 +131,22 @@ contract Wrapper {
             stableCoinAmount = ((_stableCoinAmount / 2)  * 1e18);
             myTokenAmount = stableCoinAmount / getChainlinkPrice();
             require(myTokenAmount > 0, "Calculated token amount must be greater than zero");
+            
+            address[] memory path;
+            path[0] = token0;
+            path[1] = token1;
             router.swapExactTokensForTokens(
                 stableCoinAmount, 
                 myTokenAmount, 
-                [token0, token1], 
+                path, 
                 msg.sender, 
                 block.timestamp + 300
                 );
         }
         IERC20(myToken).transferFrom(msg.sender, address(this), myTokenAmount); 
 
-        IERC20(stableCoin).approve(router, stableCoinAmount);
-        IERC20(myToken).approve(router, myTokenAmount);
+        IERC20(stableCoin).approve(address(router), stableCoinAmount);
+        IERC20(myToken).approve(address(router), myTokenAmount);
         
         router.addLiquidity(
             stableCoin, 
